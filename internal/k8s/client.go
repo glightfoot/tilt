@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"golang.org/x/sync/errgroup"
 	"helm.sh/helm/v3/pkg/kube"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -357,19 +358,41 @@ func (k *K8sClient) ToRawKubeConfigLoader() clientcmd.ClientConfig {
 }
 
 func (k *K8sClient) Upsert(ctx context.Context, entities []K8sEntity, timeout time.Duration) ([]K8sEntity, error) {
-	result := make([]K8sEntity, 0, len(entities))
-	for _, e := range entities {
-		innerCtx, cancel := context.WithTimeout(ctx, timeout)
-		defer cancel()
+	var g errgroup.Group
+	g.SetLimit(10) // TODO: Make this configurable
+	resultChan := make(chan []K8sEntity, len(entities))
 
-		newEntity, err := k.escalatingUpdate(innerCtx, e)
-		if err != nil {
-			if ctx.Err() == context.DeadlineExceeded {
-				return nil, timeoutError(timeout)
+	for _, e := range entities {
+		g.Go(func() error {
+			innerCtx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+
+			newEntity, err := k.escalatingUpdate(innerCtx, e)
+			if err != nil {
+				// TODO: should this be innerCtx?
+				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+					return timeoutError(timeout)
+				}
+				return err
 			}
-			return nil, err
+			resultChan <- newEntity
+			return nil
+		})
+
+	}
+
+	// collect results
+	result := make([]K8sEntity, 0, len(entities))
+	go func() {
+		for ne := range resultChan {
+			result = append(result, ne...)
 		}
-		result = append(result, newEntity...)
+	}()
+
+	err := g.Wait()
+	close(resultChan)
+	if err != nil {
+		return nil, err
 	}
 
 	return result, nil
