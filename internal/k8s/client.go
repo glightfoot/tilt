@@ -365,39 +365,43 @@ func (k *K8sClient) Upsert(ctx context.Context, entities []K8sEntity, timeout ti
 	resultChan := make(chan []K8sEntity, len(entities))
 
 	for _, e := range entities {
+		e := e
 		g.Go(func() error {
+			select {
+			case <-ctx.Done():
+				// errgroup will cancel the outer context when a task returns an error
+				return ctx.Err()
+			default:
+			}
+
 			innerCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
 
+			newEntity, err := k.escalatingUpdate(innerCtx, e)
+			if err != nil {
+				// TODO: should this be innerCtx?
+				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+					return timeoutError(timeout)
+				}
+				return err
+			}
 			select {
 			case <-ctx.Done():
-				//errgroup will cancel the outer context when a task returns an error
 				return ctx.Err()
 			default:
-				newEntity, err := k.escalatingUpdate(innerCtx, e)
-				if err != nil {
-					// TODO: should this be innerCtx?
-					if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-						return timeoutError(timeout)
-					}
-					return err
-				}
 				resultChan <- newEntity
 				return nil
 			}
 		})
 	}
 
-	// collect results
 	result := make([]K8sEntity, 0, len(entities))
-	go func() {
-		for ne := range resultChan {
-			result = append(result, ne...)
-		}
-	}()
 
 	err := g.Wait()
 	close(resultChan)
+	for e := range resultChan {
+		result = append(result, e...)
+	}
 	if err != nil {
 		return nil, err
 	}
