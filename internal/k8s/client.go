@@ -43,6 +43,7 @@ import (
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"github.com/tilt-dev/clusterid"
+
 	"github.com/tilt-dev/tilt/internal/container"
 	"github.com/tilt-dev/tilt/pkg/apis/core/v1alpha1"
 	"github.com/tilt-dev/tilt/pkg/logger"
@@ -358,7 +359,8 @@ func (k *K8sClient) ToRawKubeConfigLoader() clientcmd.ClientConfig {
 }
 
 func (k *K8sClient) Upsert(ctx context.Context, entities []K8sEntity, timeout time.Duration) ([]K8sEntity, error) {
-	var g errgroup.Group
+	g, ctx := errgroup.WithContext(ctx)
+
 	g.SetLimit(10) // TODO: Make this configurable
 	resultChan := make(chan []K8sEntity, len(entities))
 
@@ -367,18 +369,23 @@ func (k *K8sClient) Upsert(ctx context.Context, entities []K8sEntity, timeout ti
 			innerCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
 
-			newEntity, err := k.escalatingUpdate(innerCtx, e)
-			if err != nil {
-				// TODO: should this be innerCtx?
-				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-					return timeoutError(timeout)
+			select {
+			case <-ctx.Done():
+				//errgroup will cancel the outer context when a task returns an error
+				return ctx.Err()
+			default:
+				newEntity, err := k.escalatingUpdate(innerCtx, e)
+				if err != nil {
+					// TODO: should this be innerCtx?
+					if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+						return timeoutError(timeout)
+					}
+					return err
 				}
-				return err
+				resultChan <- newEntity
+				return nil
 			}
-			resultChan <- newEntity
-			return nil
 		})
-
 	}
 
 	// collect results
